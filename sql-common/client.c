@@ -3177,6 +3177,44 @@ set_connect_attributes(MYSQL *mysql, char *buff, size_t buf_len)
   return rc > 0 ? 1 : 0;
 }
 
+#define GETADDRINFO_ESTIMATED_RESULT_COUNT 8
+
+static struct addrinfo**
+addrinfo_shuffled(struct addrinfo *from_addr_lst, size_t *count)
+{
+  void *point = NULL;
+  struct addrinfo *t_res, *tmp, **result = NULL;
+  size_t alloc, i, j;
+  alloc = 0;
+  *count = 0;
+  DBUG_ENTER("addrinfo_shuffled");
+
+  result = NULL;
+
+  /* Iterate through the existing list adding pointers to the new list */
+  for (t_res = from_addr_lst; t_res; t_res = t_res->ai_next) {
+    if ((*count - alloc) < 2 /* One more item + terminating null */) {
+      alloc = (alloc == 0) ? GETADDRINFO_ESTIMATED_RESULT_COUNT : alloc * 2;
+      result = my_realloc(result, sizeof(struct addrinfo *) * alloc, 0);
+      if (result == NULL)
+        goto finish;
+    }
+
+    result[(*count)++] = t_res;
+  }
+
+  /* Shuffle the new list */
+  for (i = 0; i < *count; ++i) {
+    j = arc4random() % (i + 1);
+    tmp = result[i];
+    result[i] = result[j];
+    result[j] = tmp;
+  }
+
+ finish:
+  DBUG_RETURN(point);
+  return result;
+}
 
 MYSQL * STDCALL 
 CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
@@ -3389,7 +3427,8 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
       (!mysql->options.protocol ||
        mysql->options.protocol == MYSQL_PROTOCOL_TCP))
   {
-    struct addrinfo *res_lst, *client_bind_ai_lst= NULL, hints, *t_res;
+    struct addrinfo *res_lst, **res_lst_shuf, *client_bind_ai_lst= NULL, hints, *t_res;
+    size_t res_lst_shuf_count, res_lst_shuf_iter;
     char port_buf[NI_MAXSERV];
     my_socket sock= SOCKET_ERROR;
     int gai_errno, saved_error= 0, status= -1, bind_result= 0;
@@ -3452,6 +3491,17 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
       DBUG_PRINT("info", ("  got address info for client bind name"));
     }
 
+    res_lst_shuf = addrinfo_shuffled(res_lst, &res_lst_shuf_count);
+    if (res_lst_shuf == NULL) {
+        DBUG_PRINT("info",("client bind addrinfo_shuffled realloc error"));
+        set_mysql_extended_error(mysql, CR_UNKNOWN_HOST, unknown_sqlstate,
+                                 ER(CR_UNKNOWN_HOST),
+                                 mysql->options.ci.bind_address,
+                                 errno);
+      freeaddrinfo(res_lst);
+      goto error;
+    }
+
     /*
       A hostname might map to multiple IP addresses (IPv4/IPv6). Go over the
       list of IP addresses until a successful connection can be established.
@@ -3459,8 +3509,9 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
       for the client-side bind hostname until the bind is successful.
     */
     DBUG_PRINT("info", ("Try connect on all addresses for host."));
-    for (t_res= res_lst; t_res; t_res= t_res->ai_next)
+    for (res_lst_shuf_iter = 0; res_lst_shuf_iter < res_lst_shuf_count; ++res_lst_shuf_iter)
     {
+      t_res = res_lst_shuf[res_lst_shuf_iter];
       DBUG_PRINT("info", ("Create socket, family: %d  type: %d  proto: %d",
                           t_res->ai_family, t_res->ai_socktype,
                           t_res->ai_protocol));
@@ -3525,6 +3576,7 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
           freeaddrinfo(res_lst);
           if (client_bind_ai_lst)
             freeaddrinfo(client_bind_ai_lst);
+          my_free(res_lst_shuf);
           goto error;
         }
       }
@@ -3536,6 +3588,7 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
         freeaddrinfo(res_lst);
         if (client_bind_ai_lst)
           freeaddrinfo(client_bind_ai_lst);
+        my_free(res_lst_shuf);
         goto error;
       }
 
@@ -3566,6 +3619,7 @@ CLI_MYSQL_REAL_CONNECT(MYSQL *mysql,const char *host, const char *user,
     freeaddrinfo(res_lst);
     if (client_bind_ai_lst)
       freeaddrinfo(client_bind_ai_lst);
+    my_free(res_lst_shuf);
 
     if (sock == SOCKET_ERROR)
     {
